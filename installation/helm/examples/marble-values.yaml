@@ -1,0 +1,39 @@
+# marble_config/marble-values.yaml
+#
+# Static, NON-secret overrides for the Marble chart, committed in reasy-infra-apps
+# (mirrors the n8n_config/superset_config/... convention: only override what differs
+# from chart defaults; keep secrets and stage-dependent values out of this file —
+# those are injected from helm_marble.tf via `set`).
+
+image:
+  backend:
+    tag: "v1.12.0"
+  frontend:
+    tag: "v1.12.0"
+
+# Firebase auth (project is static; the Web API key + SA JSON are secrets set in TF).
+auth:
+  firebase:
+    projectId: reasy-marble
+    authDomain: reasy-marble.firebaseapp.com
+
+# AWS S3 blob storage with injected static credentials (keys are secrets set in TF).
+storage:
+  aws:
+    region: eu-west-1
+    useIrsa: false
+
+# Screening via OpenSanctions SaaS (apiHost empty => https://api.opensanctions.org).
+# Only the API key is a secret (set in TF).
+
+# Replicas / resources (tune per stage).
+apiServer:
+  replicas: 1
+worker:
+  replicas: 1
+frontend:
+  replicas: 2
+
+# The IngressRoute is authored in helm_marble.tf as a kubernetes_manifest (repo convention).
+ingressRoute:
+  enabled: false

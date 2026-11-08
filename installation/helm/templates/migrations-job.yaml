@@ -1,0 +1,91 @@
+{{- if .Values.migrations.enabled -}}
+{{- /*
+  DB migrations run as a Helm pre-install + pre-upgrade hook, BEFORE api-server/worker
+  (which fatal at boot without the migration-seeded `deployment_id` row). Migrations are
+  idempotent and safe to re-run.
+
+  Secrets: pre-install hooks run BEFORE the chart's normal Secret exists, so when the chart
+  manages the Secret we inline the PG credentials into this Job (rendered from Terraform-set
+  values). When `secrets.existingSecret` is used (created out-of-band) we reference it instead.
+  No ServiceAccount is set so the always-present "default" SA is used (migrations need only DB).
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "marble.fullname" . }}-migrations
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "marble.labels" (dict "ctx" . "component" "migrations") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": {{ .Values.migrations.hookWeight | quote }}
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "marble.selectorLabels" (dict "ctx" . "component" "migrations") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrations
+          image: {{ include "marble.backendImage" . }}
+          imagePullPolicy: {{ .Values.image.backend.pullPolicy }}
+          command: ["/app"]
+          args: ["--migrations"]
+          env:
+            - name: ENV
+              value: {{ .Values.common.env | quote }}
+            - name: LOGGING_FORMAT
+              value: {{ .Values.common.loggingFormat | quote }}
+            {{- if .Values.postgres.connectionString }}
+            - name: PG_CONNECTION_STRING
+              {{- if .Values.secrets.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: PG_CONNECTION_STRING
+              {{- else }}
+              value: {{ .Values.postgres.connectionString | quote }}
+              {{- end }}
+            {{- else }}
+            - name: PG_HOSTNAME
+              value: {{ .Values.postgres.host | quote }}
+            - name: PG_PORT
+              value: {{ .Values.postgres.port | quote }}
+            - name: PG_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: PG_DATABASE
+              value: {{ .Values.postgres.database | quote }}
+            - name: PG_SSL_MODE
+              value: {{ .Values.postgres.sslMode | quote }}
+            {{- if .Values.postgres.impersonateRole }}
+            - name: PG_IMPERSONATE_ROLE
+              value: {{ .Values.postgres.impersonateRole | quote }}
+            {{- end }}
+            - name: PG_PASSWORD
+              {{- if .Values.secrets.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: PG_PASSWORD
+              {{- else }}
+              value: {{ .Values.postgres.password | quote }}
+              {{- end }}
+            {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+{{- end }}

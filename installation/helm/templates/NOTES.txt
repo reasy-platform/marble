@@ -1,0 +1,35 @@
+Marble {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  - {{ include "marble.fullname" . }}-api        (./app --server)  ClusterIP :{{ .Values.common.port }}
+  - {{ include "marble.fullname" . }}-worker     (./app --worker)
+  - {{ include "marble.fullname" . }}-frontend   (SSR UI)          ClusterIP :{{ .Values.common.port }}
+  - {{ include "marble.fullname" . }}-migrations (Helm pre-install/pre-upgrade hook)
+
+Screening: {{ if .Values.screening.opensanctions.apiHost }}self-hosted ({{ .Values.screening.opensanctions.apiHost }}){{ else }}OpenSanctions SaaS (https://api.opensanctions.org){{ end }}.
+
+Frontend SSR -> API URL: {{ include "marble.apiUrl" . }}
+
+{{- if .Values.ingressRoute.enabled }}
+Public URL: https://{{ .Values.ingressRoute.host }}  (Traefik IngressRoute, entryPoints {{ .Values.ingressRoute.entryPoints | join "," }})
+{{- else }}
+IngressRoute: not rendered by the chart (ingressRoute.enabled=false). Author it in Terraform
+(see the chart's examples/helm_marble.tf) or set ingressRoute.enabled=true and ingressRoute.host.
+{{- end }}
+
+Pre-flight checks:
+{{- if not .Values.secrets.existingSecret }}
+  * secrets.* are templated into Secret "{{ include "marble.fullname" . }}".
+{{- else }}
+  * Using existing Secret "{{ .Values.secrets.existingSecret }}" — it MUST contain:
+    PG_PASSWORD, FIREBASE_API_KEY, SCREENING_OPENSANCTIONS_API_KEY, SESSION_SECRET
+    {{- if .Values.auth.firebase.serviceAccount.enabled }}, GCP_SERVICE_ACCOUNT_JSON{{ end }}
+    {{- if .Values.apiServer.jwtSigningKey.enabled }}, AUTHENTICATION_JWT_SIGNING_KEY{{ end }}
+{{- end }}
+  * SESSION_SECRET MUST be >= 32 characters or the frontend throws on first request.
+  * MARBLE_APP_URL (urls.appUrl): {{ if .Values.urls.appUrl }}{{ .Values.urls.appUrl }}{{ else }}NOT SET — decision links / auth redirects will break.{{ end }}
+  * S3 ingestion bucket: {{ if .Values.storage.ingestionBucketUrl }}{{ .Values.storage.ingestionBucketUrl }}{{ else }}NOT SET — the worker will fatal at boot.{{ end }}
+{{- if and .Values.apiServer.jwtSigningKey.enabled (not .Values.secrets.existingSecret) (not .Values.apiServer.jwtSigningKey.pem) }}
+  * WARNING: apiServer.jwtSigningKey.enabled=true but no PEM provided — a new key will be generated
+    on every restart (users logged out on each restart, multi-replica breaks). Provide a stable key.
+{{- end }}

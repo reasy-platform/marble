@@ -1,0 +1,212 @@
+# values.yaml — Marble Helm chart
+#
+# Deploy profile (tailored, not a generic public chart):
+#   * EXTERNAL PostgreSQL (no in-chart DB)
+#   * EXTERNAL OpenSanctions SaaS (no Elasticsearch / yente / motiva)
+#   * Firebase authentication + AWS S3 blob storage, on EKS
+#   * Routed via a Traefik IngressRoute (traefik.io/v1alpha1)
+#
+# Secret convention (matches reasy-infra-apps): sensitive values are injected via the
+# Terraform `helm_release` `set = [...]` list and the chart renders a Secret from them.
+# There is NO external-secrets / sealed-secrets dependency. To instead reference a
+# pre-existing Secret, set `secrets.existingSecret` (it must carry the documented keys).
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  backend:
+    # Mirror these to your own registry (e.g. ECR) for production.
+    repository: europe-west1-docker.pkg.dev/marble-infra/marble/marble-backend
+    tag: "v1.12.0"
+    pullPolicy: IfNotPresent
+  frontend:
+    repository: europe-west1-docker.pkg.dev/marble-infra/marble/marble-frontend
+    tag: "v1.12.0"
+    pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# ---- Shared, non-sensitive runtime config ----
+common:
+  env: production            # NEVER "development" (enables insecure webhooks / dev CORS / leaked stacks)
+  loggingFormat: json        # structured logs for k8s
+  requestLoggingLevel: ""    # optional: "" | "all" | "error"
+  port: 8080                 # api-server + frontend container port
+
+service:
+  type: ClusterIP
+
+# ---- Sensitive values ----
+# The chart creates a Secret from any non-empty value marked "(secret)" below.
+# Set `existingSecret` to use a pre-existing Secret instead (must carry the same keys).
+secrets:
+  existingSecret: ""
+
+# ---- External PostgreSQL ----
+postgres:
+  host: ""                   # REQUIRED — RDS endpoint (Terraform: data.aws_db_instance.rds.address)
+  port: 5432
+  user: ""                   # REQUIRED — RDS username
+  database: marble           # docs require DB named "marble" (search_path marble,public)
+  sslMode: require           # use "require" (or stricter) for external Postgres
+  maxPoolSize: ""            # optional (code default 40)
+  impersonateRole: ""        # optional Postgres SET ROLE target (IAM auth/RBAC)
+  password: ""               # (secret) -> Secret key PG_PASSWORD
+  connectionString: ""       # (secret) optional full DSN; if set OVERRIDES all PG_* above. -> Secret key PG_CONNECTION_STRING
+
+# ---- Authentication: Firebase ----
+auth:
+  provider: firebase
+  firebase:
+    apiKey: ""               # (secret) REQUIRED — Firebase Web API key. api-server FATALS at boot if missing.
+    projectId: "reasy-marble"            # REQUIRED off-GCP (no ADC project on EKS)
+    authDomain: "reasy-marble.firebaseapp.com"           # optional; defaults to <projectId>.firebaseapp.com (set only for federated SSO)
+    googleCloudProject: ""   # optional GOOGLE_CLOUD_PROJECT
+    serviceAccount:
+      # GCP service-account JSON for the Firebase Admin SDK. REQUIRED off-GCP (EKS) so the
+      # backend can verify Firebase tokens / manage users. Mounted as a file.
+      enabled: true
+      json: ""               # (secret) the SA key JSON. -> Secret key GCP_SERVICE_ACCOUNT_JSON
+                             #   For large JSON prefer `secrets.existingSecret` over Terraform `set`.
+      mountPath: /secrets/gcp/service_account_key.json
+
+# ---- Screening: OpenSanctions SaaS (no self-hosted ES/yente/motiva) ----
+screening:
+  opensanctions:
+    apiKey: "reasy-marble"               # (secret) REQUIRED for screening. -> Secret key SCREENING_OPENSANCTIONS_API_KEY
+    apiHost: ""              # LEAVE EMPTY => SaaS https://api.opensanctions.org (env omitted when empty)
+    authMethod: ""           # LEAVE EMPTY in SaaS mode (env omitted when empty)
+
+# ---- Blob storage: AWS S3 / S3-compatible ----
+storage:
+  ingestionBucketUrl: ""     # REQUIRED — e.g. s3://marble-ingestion-prod (worker FATALS without it)
+  caseManagerBucketUrl: ""   # optional (case files); may reuse the ingestion bucket
+  aws:
+    region: "eu-west-1"               # e.g. eu-west-1
+    useIrsa: false           # false: inject the static AWS keys below. true: rely on a ServiceAccount IAM role (IRSA).
+    accessKeyId: ""          # (secret) REQUIRED when useIrsa=false. -> Secret key AWS_ACCESS_KEY_ID
+    secretAccessKey: ""      # (secret) REQUIRED when useIrsa=false. -> Secret key AWS_SECRET_ACCESS_KEY
+
+# ---- Analytics export (optional Marble feature) ----
+analytics:
+  bucketUrl: ""              # optional ANALYTICS_BUCKET_URL (DuckDB/Parquet analytics export); empty => feature disabled (env omitted)
+
+# ---- Public / internal URLs ----
+urls:
+  appUrl: "https://marble.reasy.fr"                 # REQUIRED — public frontend URL, e.g. https://marble.reasy.fr (MARBLE_APP_URL)
+  apiUrl: ""                 # SSR->API URL; empty => computed internal cluster DNS to the api Service
+  apiInternalUrl: ""         # optional; falls back to apiUrl
+
+# ---- api-server (./app --server) ----
+apiServer:
+  replicas: 1
+  jwtSigningKey:
+    # Stable RSA key for signing Marble session/auth tokens. Without it a NEW key is generated
+    # on every restart -> all sessions invalidated and multi-replica breaks. Strongly recommended.
+    enabled: true
+    pem: ""                  # (secret) RSA private key PEM. -> Secret key AUTHENTICATION_JWT_SIGNING_KEY
+                             #   For multi-line PEM prefer `secrets.existingSecret`.
+                             #   Generate: openssl genrsa 4096
+    mountPath: /secrets/jwt/signing_key.pem
+  resources:
+    # ephemeral-storage: requests let the scheduler reserve node disk (so it stops over-packing);
+    # limits cap writable-layer + logs + /tempFiles so a runaway pod is evicted alone, not the node.
+    requests: { cpu: 128m, memory: 256Mi}
+    limits:   { cpu: "1",  memory: 1Gi}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---- api-worker (./app --worker) ----
+worker:
+  replicas: 1
+  probePort: 8080            # CLOUD_RUN_PROBE_PORT — enables the worker health server for k8s probes (set "" to disable)
+  resources:
+    # See apiServer.resources note. Worker also offloads to s3://, so its disk needs are small.
+    requests: { cpu: 128m, memory: 256Mi}
+    limits:   { cpu: "1",  memory: 1Gi}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---- frontend (TanStack Start SSR) ----
+frontend:
+  replicas: 1
+  nodeEnv: production        # OVERRIDES the image's hardcoded NODE_ENV=development (prevents leaked error stacks)
+  session:
+    secret: ""               # (secret) MUST be >=32 chars. -> Secret key SESSION_SECRET. Generate: openssl rand -base64 48
+    maxAge: 43200            # seconds (12h)
+  resources:
+    # SSR writes little to disk; small reservation keeps the scheduler's node-disk accounting honest.
+    requests: { cpu: 100m, memory: 256Mi}
+    limits:   { cpu: 500m, memory: 512Mi }
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---- License (optional; empty = free/NotFound license, NOT fatal) ----
+license:
+  key: ""                    # (secret) optional premium key. -> Secret key LICENSE_KEY
+  # KILL_IF_READ_LICENSE_ERROR is intentionally never set — true would fatal a self-hosted instance at boot.
+
+# ---- First-boot bootstrap (set once, then blank). Admin must also exist in Firebase. ----
+bootstrap:
+  orgName: "REasy"
+  orgAdminEmail: "stephane.meng@reasy.fr"
+  globalAdminEmail: ""
+
+# ---- Data offloading (optional; recommended at scale; off for the baseline deploy) ----
+offloading:
+  enabled: true
+  bucketUrl: "s3://marble-offloading-prod"              # required on server+worker when enabled, e.g. s3://marble-offloading-prod
+
+# ---- Observability (optional; Marble defaults = off) ----
+observability:
+  sentry:
+    dsn: ""                  # (secret) optional Sentry error reporting; empty = disabled. -> Secret key SENTRY_DSN
+  prometheus:
+    enabled: false           # exposes in-cluster /metrics (api-server; worker only with probePort). Opt-in.
+
+# ---- ServiceAccount (annotate for EKS IRSA so S3 works without static AWS keys) ----
+serviceAccount:
+  create: true
+  name: marble
+  annotations: {}            # e.g. eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/marble-s3
+
+# ---- DB migrations (./app --migrations) ----
+# Runs as a Helm pre-install/pre-upgrade hook Job BEFORE api-server/worker (which fatal without
+# the migration-seeded deployment_id row). Migrations are idempotent/safe to re-run.
+migrations:
+  enabled: true
+  backoffLimit: 3
+  hookWeight: -5
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+
+# ---- Traefik IngressRoute ----
+# Per the reasy-infra-apps convention the IngressRoute is usually authored in Terraform as a
+# kubernetes_manifest (see examples/helm_marble.tf), so this defaults OFF. Set enabled=true to
+# have the chart render it instead. Only the frontend is exposed; api-server/worker stay internal.
+ingressRoute:
+  enabled: false
+  ingressClass: traefik-public          # "traefik-internal" for internal-only
+  entryPoints: [websecure, web]
+  host: ""                              # e.g. marble.reasy.fr
+  externalDnsTarget: ""                 # external-dns.alpha.kubernetes.io/target (e.g. public NLB DNS)
+  tls:
+    certResolver: le                    # "ledns" for internal-only services
+  # Optionally also expose Marble's programmatic public API (/v1, /v1beta) to external clients.
+  publicApi:
+    enabled: false
+    pathPrefixes: ["/v1", "/v1beta"]
+
+# ---- Pod security / scheduling (chart-wide defaults) ----
+podSecurityContext: {}
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
